@@ -9,6 +9,8 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Text } from "@earendil-works/pi-tui";
 import { installNotificationFooter } from "./src/footer.ts";
+import { formatNotification, type NotificationContent } from "./src/format.ts";
+import { formatRichMessage } from "./src/rich.ts";
 import { readTelegramConfig, sendTelegram } from "./src/telegram.ts";
 
 const ENTRY_TYPE = "telegram-notification";
@@ -104,21 +106,26 @@ export default function (pi: ExtensionAPI) {
           .map((part) => part.text)
           .join("\n");
     const name = ctx.sessionManager.getSessionName() || ctx.sessionManager.getSessionId().slice(0, 8);
-    const notification = [
-      `Message from ${hostname()}:`,
-      `Pi ${status}`,
-      `Session: ${name}`,
-      `Directory: ${ctx.cwd}`,
-      detail ? `\n${detail}` : "",
-    ].filter(Boolean).join("\n");
+    const content: NotificationContent = {
+      host: hostname(),
+      status,
+      session: name,
+      cwd: ctx.cwd,
+      detail,
+      markdown: status !== "error",
+    };
+    const { text: notification, html } = formatNotification(content);
 
     let sent = false;
     let message: string;
     try {
       const config = await readTelegramConfig(configPath);
-      await sendTelegram(config, notification);
+      const rich = await formatRichMessage(content);
+      const delivery = await sendTelegram(config, { rich, html, text: notification });
       sent = true;
-      message = `Notification sent (${status}).`;
+      message = delivery.rejection
+        ? `Notification sent as ${delivery.format} (${status}). Telegram rejected the rich message: ${delivery.rejection}`
+        : `Notification sent (${status}).`;
     } catch (error) {
       message = `Notification failed: ${(error as Error).message}`;
     }

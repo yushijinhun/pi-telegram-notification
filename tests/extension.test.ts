@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
@@ -24,9 +24,23 @@ const plain = (text: string) => text.replace(/\x1b\[[0-9;]*m/g, "");
 
 interface FixtureOptions {
   responses?: Array<"stop" | "error" | "retry">;
+  reply?: string;
   waitForAbort?: boolean;
   rejectDelivery?: boolean;
+  rejectRich?: boolean;
+  rejectImages?: boolean;
+  rejectHtml?: boolean;
   extension?: (pi: ExtensionAPI) => void;
+}
+
+interface Delivery {
+  method: string;
+  /** The rich message's Markdown, or sendMessage's text. */
+  text: string;
+  parseMode?: string;
+  /** Uploaded multipart files. */
+  files: string[];
+  signal: AbortSignal | null | undefined;
 }
 
 async function fixture(t: TestContext, options: FixtureOptions = {}) {
@@ -41,15 +55,34 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
   });
   await writeFile(config, JSON.stringify(credentials));
 
-  const deliveries: Array<{ text: string; signal: AbortSignal | null | undefined }> = [];
+  const deliveries: Delivery[] = [];
   t.mock.method(globalThis, "fetch", async (url: string | URL | Request, init?: RequestInit) => {
-    assert.equal(String(url), `https://api.telegram.org/bot${credentials.botToken}/sendMessage`);
-    const body = JSON.parse(String(init?.body));
+    const method = String(url).replace(`https://api.telegram.org/bot${credentials.botToken}/`, "");
+    assert.ok(method === "sendRichMessage" || method === "sendMessage", method);
+    let body: Record<string, any>;
+    let files: string[] = [];
+    if (init?.body instanceof FormData) {
+      body = { chat_id: init.body.get("chat_id"), rich_message: JSON.parse(String(init.body.get("rich_message"))) };
+      files = [...init.body.keys()].filter((key) => key !== "chat_id" && key !== "rich_message");
+    } else {
+      body = JSON.parse(String(init?.body));
+    }
     assert.equal(body.chat_id, credentials.chatId);
-    deliveries.push({ text: body.text, signal: init?.signal });
-    return Response.json(options.rejectDelivery
-      ? { ok: false, description: "Bad Request: chat not found" }
-      : { ok: true, result: { message_id: deliveries.length } });
+    const rich = method === "sendRichMessage";
+    const text: string = rich ? body.rich_message.markdown : body.text;
+    deliveries.push({ method, text, parseMode: body.parse_mode, files, signal: init?.signal });
+    const rejection = options.rejectDelivery
+      ? "Bad Request: chat not found"
+      : options.rejectRich && rich
+        ? "Bad Request: RICH_MESSAGE_INVALID"
+        : options.rejectImages && rich && text.includes("![")
+          ? "Bad Request: RICH_MESSAGE_PHOTO_INVALID"
+          : options.rejectHtml && body.parse_mode === "HTML"
+            ? "Bad Request: can't parse entities: Unsupported start tag \"x\" at byte offset 0"
+            : undefined;
+    return rejection
+      ? Response.json({ ok: false, error_code: 400, description: rejection }, { status: 400 })
+      : Response.json({ ok: true, result: { message_id: deliveries.length } });
   });
 
   const settings = SettingsManager.inMemory({
@@ -89,7 +122,7 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
         model: model.id,
         content: [
           { type: "thinking", thinking: "Do not notify with thinking." },
-          { type: "text", text: "The task is complete." },
+          { type: "text", text: options.reply ?? "The task is complete." },
         ],
         stopReason: result === "stop" ? "stop" : "error",
         ...(result === "error" ? { errorMessage: "Permission denied" } : {}),
@@ -220,7 +253,8 @@ test("one delivery and thread receipt after retries and queued follow-ups have f
   await f.session.prompt("Do the task.");
   assert.equal(f.calls(), 3);
   assert.equal(f.deliveries.length, 1);
-  assert.match(f.deliveries[0].text, /Pi completed/);
+  assert.equal(f.deliveries[0].method, "sendRichMessage");
+  assert.match(f.deliveries[0].text, /\*\*Pi completed\*\*/);
   assert.match(f.deliveries[0].text, /The task is complete\./);
   assert.ok(!f.deliveries[0].text.includes("thinking"));
   assert.equal(f.receipts().length, 1);
@@ -261,4 +295,55 @@ test("Telegram API rejection is displayed as a failed delivery", async (t) => {
   assert.equal(data.sent, false);
   assert.match(data.message, /Notification failed: Bad Request: chat not found/);
   assert.equal(f.calls(), 1);
+  assert.deepEqual(
+    f.deliveries.map((delivery) => [delivery.method, delivery.parseMode]),
+    [["sendRichMessage", undefined], ["sendMessage", "HTML"], ["sendMessage", undefined]],
+  );
+});
+
+test("if Telegram rejects the rich message, HTML is sent, and plain text if it rejects the HTML", async (t) => {
+  const f = await fixture(t, { reply: "The task is **complete** & <verified>.", rejectRich: true, rejectHtml: true });
+  await f.session.prompt("/notify on");
+  await f.session.prompt("Finish the task.");
+  assert.deepEqual(
+    f.deliveries.map((delivery) => [delivery.method, delivery.parseMode]),
+    [["sendRichMessage", undefined], ["sendMessage", "HTML"], ["sendMessage", undefined]],
+  );
+  assert.match(f.deliveries[0].text, /\n\nThe task is \*\*complete\*\* & &lt;verified>\.$/);
+  assert.match(f.deliveries[1].text, /\n<b>Pi completed<\/b>\n/);
+  assert.match(f.deliveries[1].text, /\n\nThe task is <b>complete<\/b> &amp; &lt;verified&gt;\.$/);
+  assert.match(f.deliveries[2].text, /\nPi completed\n/);
+  assert.match(f.deliveries[2].text, /\n\nThe task is \*\*complete\*\* & <verified>\.$/);
+  const entry = f.receipts()[0];
+  assert.ok(entry?.type === "custom");
+  const data = entry.data as { sent: boolean; message: string };
+  assert.equal(data.sent, true);
+  assert.equal(
+    data.message,
+    "Notification sent as plain text (completed). Telegram rejected the rich message: Bad Request: RICH_MESSAGE_INVALID",
+  );
+});
+
+test("local images are uploaded, and sent as text if Telegram rejects them", async (t) => {
+  const f = await fixture(t, { reply: "Here is the plot:\n\n![Plot](plot.png)", rejectImages: true });
+  const dir = dirname(f.config);
+  await writeFile(join(dir, "plot.png"), Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+    "base64",
+  ));
+  await f.session.prompt("/notify on");
+  await f.session.prompt("Plot the results.");
+  assert.deepEqual(f.deliveries.map((delivery) => [delivery.method, delivery.files]), [
+    ["sendRichMessage", ["image1"]],
+    ["sendRichMessage", []],
+  ]);
+  assert.match(f.deliveries[0].text, /\n\nHere is the plot:\n\n!\[\]\(tg:\/\/photo\?id=image1 "Plot"\)$/);
+  assert.ok(f.deliveries[1].text.endsWith(`\n\nHere is the plot:\n\nPlot \`${dir}/plot.png\``));
+  const entry = f.receipts()[0];
+  assert.ok(entry?.type === "custom");
+  assert.equal(
+    (entry.data as { message: string }).message,
+    "Notification sent as rich message without images (completed). " +
+      "Telegram rejected the rich message: Bad Request: RICH_MESSAGE_PHOTO_INVALID",
+  );
 });
