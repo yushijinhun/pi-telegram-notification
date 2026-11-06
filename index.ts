@@ -45,15 +45,83 @@ export default function (pi: ExtensionAPI) {
     return new Text(text, 0, 0);
   });
 
+  function notificationContent(
+    ctx: ExtensionContext,
+    status: string,
+    response: AssistantMessage | undefined,
+  ): NotificationContent {
+    const detail = status === "error"
+      ? response?.errorMessage || "The agent stopped with an error."
+      : response?.content
+          .filter((part) => part.type === "text")
+          .map((part) => part.text)
+          .join("\n");
+    const name = ctx.sessionManager.getSessionName() || ctx.sessionManager.getSessionId().slice(0, 8);
+    return {
+      host: hostname(),
+      status,
+      session: name,
+      cwd: ctx.cwd,
+      detail,
+      markdown: status !== "error",
+    };
+  }
+
+  async function deliver(content: NotificationContent): Promise<void> {
+    const { text: notification, html } = formatNotification(content);
+    let sent = false;
+    let message: string;
+    try {
+      const config = await readTelegramConfig(configPath);
+      const rich = await formatRichMessage(content);
+      const delivery = await sendTelegram(config, { rich, html, text: notification });
+      sent = true;
+      message = delivery.rejection
+        ? `Notification sent as ${delivery.format} (${content.status}). Telegram rejected the rich message: ${delivery.rejection}`
+        : `Notification sent (${content.status}).`;
+    } catch (error) {
+      message = `Notification failed: ${(error as Error).message}`;
+    }
+    // Durable thread receipt, outside model context, without starting another turn.
+    pi.appendEntry<NotificationReceipt>(ENTRY_TYPE, {
+      sent,
+      message,
+      notification,
+      timestamp: Date.now(),
+    });
+  }
+
   pi.registerCommand("notify", {
-    description: "Toggle Telegram notifications: /notify [on|off] (default off)",
-    getArgumentCompletions: (prefix) => ["on", "off"]
+    description: "Toggle Telegram notifications: /notify [on|off] (default off). /notify last sends the last response.",
+    getArgumentCompletions: (prefix) => ["on", "off", "last"]
       .filter((value) => value.startsWith(prefix))
       .map((value) => ({ value, label: value })),
     handler: async (args, ctx) => {
       const argument = args.trim().toLowerCase();
-      if (argument && argument !== "on" && argument !== "off") {
-        ctx.ui.notify("Usage: /notify [on|off]", "error");
+      if (argument && argument !== "on" && argument !== "off" && argument !== "last") {
+        ctx.ui.notify("Usage: /notify [on|off|last]", "error");
+        return;
+      }
+
+      if (argument === "last") {
+        // Commands run while the agent works. Its latest message is not a final response yet.
+        if (!ctx.isIdle()) {
+          ctx.ui.notify("Pi is still working. Use /notify on to be notified when it stops.", "error");
+          return;
+        }
+        // Read the session, so this also works after /reload, /resume, and /tree.
+        const response = ctx.sessionManager.getBranch()
+          .flatMap((entry) => entry.type === "message" && entry.message.role === "assistant" ? [entry.message] : [])
+          .at(-1);
+        if (!response) {
+          ctx.ui.notify("No response to send.", "error");
+          return;
+        }
+        const status = response.stopReason === "error" || response.stopReason === "aborted"
+          ? response.stopReason
+          // The run stopped before the requested tools returned.
+          : response.stopReason === "toolUse" ? "aborted" : "completed";
+        await deliver(notificationContent(ctx, status, response));
         return;
       }
 
@@ -99,43 +167,7 @@ export default function (pi: ExtensionAPI) {
     const status = event.aborted || lastAssistant?.stopReason === "aborted"
       ? "aborted"
       : outcome ?? (lastAssistant?.stopReason === "error" ? "error" : "stopped");
-    const detail = status === "error"
-      ? lastAssistant?.errorMessage || "The agent stopped with an error."
-      : lastAssistant?.content
-          .filter((part) => part.type === "text")
-          .map((part) => part.text)
-          .join("\n");
-    const name = ctx.sessionManager.getSessionName() || ctx.sessionManager.getSessionId().slice(0, 8);
-    const content: NotificationContent = {
-      host: hostname(),
-      status,
-      session: name,
-      cwd: ctx.cwd,
-      detail,
-      markdown: status !== "error",
-    };
-    const { text: notification, html } = formatNotification(content);
-
-    let sent = false;
-    let message: string;
-    try {
-      const config = await readTelegramConfig(configPath);
-      const rich = await formatRichMessage(content);
-      const delivery = await sendTelegram(config, { rich, html, text: notification });
-      sent = true;
-      message = delivery.rejection
-        ? `Notification sent as ${delivery.format} (${status}). Telegram rejected the rich message: ${delivery.rejection}`
-        : `Notification sent (${status}).`;
-    } catch (error) {
-      message = `Notification failed: ${(error as Error).message}`;
-    }
-    // Durable thread receipt, outside model context, without starting another turn.
-    pi.appendEntry<NotificationReceipt>(ENTRY_TYPE, {
-      sent,
-      message,
-      notification,
-      timestamp: Date.now(),
-    });
+    await deliver(notificationContent(ctx, status, lastAssistant));
   });
 
   pi.on("session_shutdown", () => {

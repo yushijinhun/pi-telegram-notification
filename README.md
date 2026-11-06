@@ -30,12 +30,15 @@ Set the file permissions to `600`. Both fields are required. Credentials are rea
 - `/notify` toggles notifications.
 - `/notify on` enables them.
 - `/notify off` disables them.
+- `/notify last` sends the last response now, for when you forgot to enable notifications. It does not turn notifications on.
 
 Notifications default to **off** on each session start, session switch, and `/reload`. If credentials are missing or invalid, `/notify` reports an error and leaves notifications off.
 
 While enabled, ` [Notification On]` appears inline in Pi's stats footer, alongside other inline extensions such as pi-token-speed. It uses the built-in footer's render method, so it requires Pi's standard footer.
 
 One notification is sent when the complete agent run settles, after automatic retries, compaction, and queued follow-ups. Successful runs, final errors, and user aborts all notify. Enabling notifications itself does not send a message.
+
+`/notify last` reads the last assistant response on the current branch of the session, so it also works after `/reload`, `/resume`, or `/tree`. It sends the same message a notification would, with the status taken from how that response ended. While Pi is working, it reports an error; use `/notify on` to be notified when the run stops.
 
 The message contains the hostname, session name or ID, working directory, and the final assistant text or error, limited to Telegram's message size. Thinking and tool output are omitted.
 

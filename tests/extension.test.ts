@@ -262,6 +262,47 @@ test("one delivery and thread receipt after retries and queued follow-ups have f
   assert.equal(f.session.messages.filter((message) => message.role === "custom").length, 0);
 });
 
+test("/notify last sends the last response without turning notifications on", async (t) => {
+  const f = await fixture(t);
+  await f.session.prompt("/notify last");
+  assert.deepEqual(f.notices.at(-1), { message: "No response to send.", type: "error" });
+  await f.session.prompt("Do the task.");
+  assert.equal(f.deliveries.length, 0);
+  await f.session.reload();
+  await f.session.prompt("/notify last");
+  assert.equal(f.deliveries.length, 1);
+  assert.match(f.deliveries[0].text, /\*\*Pi completed\*\*/);
+  assert.match(f.deliveries[0].text, /The task is complete\./);
+  assert.ok(!f.deliveries[0].text.includes("thinking"));
+  const entry = f.receipts()[0];
+  assert.ok(entry?.type === "custom");
+  assert.equal((entry.data as { message: string }).message, "Notification sent (completed).");
+  assert.ok(!plain(f.footer.render(100)[1]).includes("[Notification On]"));
+  await f.session.prompt("Do another task.");
+  assert.equal(f.deliveries.length, 1);
+});
+
+test("/notify last sends a final error, and waits for a running agent", async (t) => {
+  const f = await fixture(t, { responses: ["error"] });
+  await f.session.prompt("Fail this task.");
+  await f.session.prompt("/notify last");
+  assert.equal(f.deliveries.length, 1);
+  assert.match(f.deliveries[0].text, /Pi error/);
+  assert.match(f.deliveries[0].text, /Permission denied/);
+
+  const g = await fixture(t, { waitForAbort: true });
+  const run = g.session.prompt("Wait for cancellation.");
+  await g.started;
+  await g.session.prompt("/notify last");
+  assert.equal(g.notices.at(-1)?.type, "error");
+  assert.equal(g.deliveries.length, 0);
+  await g.session.abort();
+  await run;
+  await g.session.prompt("/notify last");
+  assert.equal(g.deliveries.length, 1);
+  assert.match(g.deliveries[0].text, /Pi aborted/);
+});
+
 test("a final agent error still sends and records a receipt", async (t) => {
   const f = await fixture(t, { responses: ["error"] });
   await f.session.prompt("/notify on");
