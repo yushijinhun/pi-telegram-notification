@@ -175,6 +175,14 @@ async function fixture(t: TestContext, options: FixtureOptions = {}) {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: 100_000,
       maxTokens: 1000,
+    }, {
+      id: "second-model",
+      name: "Second model",
+      reasoning: false,
+      input: ["text"],
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+      contextWindow: 100_000,
+      maxTokens: 1000,
     }],
     streamSimple(model, context, streamOptions) {
       const user = context.messages.filter((message) => message.role === "user").at(-1);
@@ -431,13 +439,21 @@ test("a message that is not a reply asks for a session, and a button sends it", 
 test("/ls lists sessions, and its buttons turn notifications on and send the last answer", async (t) => {
   const f = await fixture(t);
   await f.session.prompt("Earlier task.");
+  // The daemon learns the first prompt when Pi reports that the run settled.
+  await waitFor(() => f.live().session.firstPrompt === "Earlier task.");
   f.telegram.send({ text: "/ls" });
   const entry = await waitFor(() => f.telegram.sent("sendMessage")[0]);
   assert.equal(entry.body.parse_mode, "HTML");
-  assert.match(entry.body.text, /^💤 <b>.+<\/b>\n<code>.+<\/code>\nIdle · notifications off$/);
+  assert.match(entry.body.text, /^💤 <b>.+<\/b>\n<code>.+<\/code>\n<i>“Earlier task\.”<\/i>\nIdle · notifications off$/);
   const data = (entry.body.reply_markup.inline_keyboard.flat() as Array<{ text: string; callback_data: string }>)
     .map((item) => [item.text, item.callback_data.split(":")[0]]);
   assert.deepEqual(data, [["Last answer", "l"], ["Notify on", "o"]]);
+
+  // A session that connected before the extension learned about first prompts still shows one.
+  f.live().session.firstPrompt = undefined;
+  f.telegram.send({ text: "/ls" });
+  const reread = await waitFor(() => f.telegram.sent("sendMessage")[1]);
+  assert.match(reread.body.text, /<i>“Earlier task\.”<\/i>/);
 
   const id = f.live().session.id;
   f.telegram.press(`o:${id}`, entry.id!);
@@ -457,6 +473,24 @@ test("/ls lists sessions, and its buttons turn notifications on and send the las
   f.telegram.send({ text: "Next task.", reply_to_message: { message_id: entry.id } });
   await waitFor(() => f.telegram.sent("sendRichMessage")[2]);
   assert.equal(f.prompts.at(-1), "Next task.");
+});
+
+test("/model lists the session's models, and a button changes the model", async (t) => {
+  const f = await fixture(t);
+  f.telegram.send({ text: "/ls" });
+  const entry = await waitFor(() => f.telegram.sent("sendMessage")[0]);
+
+  f.telegram.send({ text: "/model", reply_to_message: { message_id: entry.id } });
+  const chooser = await waitFor(() => f.telegram.sent("sendMessage")[1]);
+  assert.match(chooser.body.text, /^Choose a model for .+\nCurrent: remote-test\/remote-model\.$/);
+  const buttons = (chooser.body.reply_markup.inline_keyboard.flat() as Array<{ text: string; callback_data: string }>);
+  assert.deepEqual(buttons.map((item) => item.text), ["✓ Remote model (remote-test)", "Second model (remote-test)"]);
+
+  f.telegram.press(buttons[1].callback_data, chooser.id!);
+  await waitFor(() => f.session.model?.id === "second-model");
+  const edited = await waitFor(() => f.telegram.sent("editMessageText")[0]);
+  assert.match(edited.body.text, /^Model: remote-test\/second-model/);
+  assert.deepEqual(edited.body.reply_markup.inline_keyboard, []);
 });
 
 /** With waitForAbort, a run only ends when it is aborted. Returns the notification of one such run. */

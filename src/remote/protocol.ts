@@ -33,6 +33,8 @@ export interface SessionInfo {
   file?: string;
   name?: string;
   cwd: string;
+  /** The first prompt, shortened, so sessions in the same directory can be told apart. */
+  firstPrompt?: string;
 }
 
 export interface Hello {
@@ -60,6 +62,17 @@ export interface Result {
   ok: boolean;
   /** Shown to the user in Telegram. */
   message?: string;
+  /** Models the session can switch to, for a /model choice. */
+  models?: ModelChoice[];
+}
+
+/** A model that a session can switch to. */
+export interface ModelChoice {
+  provider: string;
+  id: string;
+  name: string;
+  /** Whether the session uses this model now. */
+  current?: boolean;
 }
 
 export type ClientMessage = Hello | Update | Result;
@@ -68,6 +81,8 @@ export type ClientMessage = Hello | Update | Result;
 export type Request =
   | { type: "prompt"; id: string; text: string; replyTo: number }
   | { type: "command"; id: string; text: string; replyTo: number }
+  | { type: "models"; id: string }
+  | { type: "model"; id: string; provider: string; modelId: string }
   | { type: "stop"; id: string }
   | { type: "notify"; id: string; enabled: boolean }
   | { type: "last"; id: string; replyTo: number };
