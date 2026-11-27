@@ -70,6 +70,7 @@ export type Request =
   | { type: "command"; id: string; text: string; replyTo: number }
   | { type: "stop"; id: string }
   | { type: "notify"; id: string; enabled: boolean }
+  | { type: "summary"; id: string; replyTo: number }
   | { type: "last"; id: string; replyTo: number };
 
 /** While away, every session notifies when it stops. */

@@ -6,12 +6,13 @@ import { setTimeout as sleep } from "node:timers/promises";
 import { callTelegram, downloadTelegramFile, TelegramError } from "../api.ts";
 import type { RemoteSettings, TelegramConfig } from "../config.ts";
 import { LinkIndex, type MessageLink } from "../remote/links.ts";
+import { readActivity, type Activity } from "./activity.ts";
 import { watchScreenLock } from "./away.ts";
 import { findSessionFile, isDirectory, matchDirectory, readSessionHeader, recentDirectories, tildify } from "./dirs.ts";
 import { attachmentsOf, composePrompt, saveAttachments } from "./files.ts";
 import { SessionHub, type LiveSession } from "./hub.ts";
 import { spawnPi, type SpawnCommands } from "./spawn.ts";
-import type { TgButton, TgCallbackQuery, TgChat, TgMessage, TgUpdate } from "./types.ts";
+import type { TgButton, TgCallbackQuery, TgChat, TgMessage, TgMessageReaction, TgUpdate } from "./types.ts";
 
 /** Telegram sends each item of an album as its own message, close together. */
 const ALBUM_WAIT_MS = 1_500;
@@ -20,6 +21,8 @@ const PENDING_MS = 60 * 60 * 1000;
 /** How long a Pi opened in WezTerm may take to connect. */
 const CONNECT_TIMEOUT_MS = 45_000;
 const MAX_CHOICES = 8;
+/** Summarizing asks a model, through the session, so it takes longer than a button round trip. */
+const SUMMARY_TIMEOUT_MS = 120_000;
 
 export interface DaemonOptions {
   telegram: TelegramConfig;
@@ -59,6 +62,8 @@ export class Daemon {
   private readonly albums = new Map<string, { messages: TgMessage[]; timer: NodeJS.Timeout }>();
   /** /ls entries, whose text shows the session's state. */
   private readonly entries = new Set<number>();
+  /** /dashboard snapshots: a reaction to one of these refreshes it in place. */
+  private readonly dashboards = new Set<number>();
   /** When an update from each stranger was last logged. */
   private readonly ignored = new Map<string, number>();
   private readonly halt = new AbortController();
@@ -123,7 +128,7 @@ export class Daemon {
         const updates = await this.api<TgUpdate[]>("getUpdates", {
           offset: this.offset,
           timeout: 50,
-          allowed_updates: ["message", "callback_query"],
+          allowed_updates: ["message", "callback_query", "message_reaction"],
         }, 70_000);
         delay = 0;
         for (const update of updates) {
@@ -151,7 +156,7 @@ export class Daemon {
    * and only the owner's reach Pi. Others get no answer at all.
    */
   private accept(update: TgUpdate): void {
-    const { message, callback_query: query } = update;
+    const { message, callback_query: query, message_reaction: reaction } = update;
     if (message) {
       if (!this.sentByOwner(message)) {
         this.ignore("message", message.from?.id, message.chat?.id);
@@ -165,7 +170,20 @@ export class Daemon {
         return;
       }
       this.enqueue(() => this.onCallback(query));
+    } else if (reaction) {
+      if (!this.reactedByOwner(reaction)) {
+        this.ignore("reaction", reaction.user?.id, reaction.chat?.id);
+        return;
+      }
+      this.enqueue(() => this.onReaction(reaction));
     }
+  }
+
+  /** A reaction of the owner in the owner's private chat with the bot. */
+  private reactedByOwner(reaction: TgMessageReaction): boolean {
+    return this.ownersChat(reaction.chat)
+      && String(reaction.user?.id) === this.options.remote.userId
+      && !reaction.user?.is_bot;
   }
 
   /** Sent by the owner, in the owner's private chat with the bot. */
@@ -241,6 +259,7 @@ export class Daemon {
     const name = command?.name.toLowerCase();
     if (name === "start" || name === "help") return this.help(id);
     if (name === "ls") return this.list();
+    if (name === "dashboard" || name === "d") return this.dashboard();
 
     const replied = message.reply_to_message?.message_id;
     const link = replied === undefined ? undefined : await this.links.lookup(replied);
@@ -276,6 +295,7 @@ export class Daemon {
       "A command sent as a reply, such as /model or /notify on, runs in that session as if typed on the computer.",
       "",
       "/ls – running sessions, with buttons for the last answer, stopping, and notifications",
+      "/dashboard – what each session is doing right now, where it is stuck, and for how long (alias /d). React to one of its messages with any emoji to refresh it.",
       "/new [directory] [prompt] – start a session. The directory can be the start of a project's name. As a reply, it starts in that session's directory.",
       "/stop – stop the session you reply to, or the only one working",
       "/reload – reload the session you reply to, or every session. A working session reloads when it stops.",
@@ -300,6 +320,36 @@ export class Daemon {
       this.entries.delete(old);
     }
   }
+
+  /**
+   * One message per running session: the tool it is inside, the last things it
+   * said, and how long ago anything happened. Read from the session files, so a
+   * session in a long tool call still answers, and nothing is asked of the agent.
+   */
+  private async dashboard(): Promise<void> {
+    const sessions = this.hub.sessions();
+    if (!sessions.length) {
+      await this.say(undefined, "No Pi session is running. Send /new to start one.");
+      return;
+    }
+    for (const live of sessions) {
+      const activity = await this.activityOf(live);
+      const sent = await this.say(undefined, describeActivity(live, activity), { html: true, keyboard: dashboardKeyboard(live), session: live });
+      if (sent === undefined) continue;
+      this.dashboards.add(sent);
+      for (const old of this.dashboards) {
+        if (this.dashboards.size <= 200) break;
+        this.dashboards.delete(old);
+      }
+    }
+  }
+
+  /** The activity of one session, or undefined when it has no session file yet. */
+  private async activityOf(live: LiveSession): Promise<Activity | undefined> {
+    const file = live.session.file ?? await findSessionFile(this.options.sessionsDir, live.session.id);
+    return file ? readActivity(file) : undefined;
+  }
+
 
   /** Save the attachments and build the prompt. Empty when the message has nothing for Pi. */
   private async promptOf(message: TgMessage, text: string): Promise<string> {
@@ -486,7 +536,7 @@ export class Daemon {
   private async onCallback(query: TgCallbackQuery): Promise<void> {
     const [action = "", key = "", index = "0"] = (query.data ?? "").split(":");
     const where = query.message?.message_id;
-    if ("lxof".includes(action) && action.length === 1) return this.onSessionButton(query, action, key);
+    if ("lxofap".includes(action) && action.length === 1) return this.onSessionButton(query, action, key);
 
     const pending = this.recall(key);
     if (!pending) {
@@ -533,6 +583,19 @@ export class Daemon {
       return;
     }
     const where = query.message?.message_id;
+    if (action === "a") {
+      if (where === undefined) return this.answer(query.id, "This message is gone.");
+      const activity = await this.activityOf(live);
+      await this.edit(where, describeActivity(live, activity), { html: true, keyboard: dashboardKeyboard(live) });
+      return this.answer(query.id, "Refreshed.");
+    }
+    if (action === "p") {
+      // The session writes the summary and sends it, so this returns at once and
+      // the queue is free for other Telegram messages while the model answers.
+      await this.answer(query.id, "Asking for a summary…");
+      void this.requestSummary(live, where);
+      return;
+    }
     const result = action === "l"
       ? await this.hub.request(live, { type: "last", replyTo: where ?? 0 })
       : action === "x"
@@ -543,6 +606,36 @@ export class Daemon {
     if (where === undefined || !result.ok) return;
     if (this.entries.has(where)) await this.edit(where, describe(live), { html: true, keyboard: sessionKeyboard(live) });
     else if (action === "x") await this.edit(where, `Stopping ${label(live)}.`);
+  }
+
+  /**
+   * Any reaction to a /dashboard snapshot refreshes it: a tap is one update, so the
+   * entry is rewritten in place with the fresh state. The reaction stays, and the
+   * bot leaves the message otherwise untouched, so this costs no chat message.
+   */
+  private async onReaction(reaction: TgMessageReaction): Promise<void> {
+    // Removing a reaction is not a request; adding or replacing one is.
+    if (!reaction.new_reaction?.length) return;
+    if (!this.dashboards.has(reaction.message_id)) return;
+    const link = await this.links.lookup(reaction.message_id);
+    const live = link ? this.hub.find(link.session) : undefined;
+    if (!live) {
+      await this.edit(reaction.message_id, "💤 That session is not running.");
+      this.dashboards.delete(reaction.message_id);
+      return;
+    }
+    const activity = await this.activityOf(live);
+    await this.edit(reaction.message_id, describeActivity(live, activity), { html: true, keyboard: dashboardKeyboard(live) });
+  }
+
+  /** Ask the session for a status summary; the reply arrives as its own Telegram message. */
+  private async requestSummary(live: LiveSession, replyTo: number | undefined): Promise<void> {
+    try {
+      const result = await this.hub.request(live, { type: "summary", replyTo: replyTo ?? 0 }, SUMMARY_TIMEOUT_MS);
+      if (!result.ok) await this.say(replyTo, `No summary: ${result.message ?? "Pi did not answer."}`, { session: live });
+    } catch (error) {
+      await this.say(replyTo, `No summary: ${errorText(error)}`, { session: live });
+    }
   }
 
   private remember(pending: Pending): string {
@@ -695,6 +788,75 @@ function sessionKeyboard(live: LiveSession): TgButton[][] {
   if (live.state !== "idle") row.push(button("Stop", `x:${id}`));
   row.push(live.notify ? button("Notify off", `f:${id}`) : button("Notify on", `o:${id}`));
   return [row];
+}
+
+/** Buttons of a /dashboard entry: it is a snapshot, so it can be taken again. */
+export function dashboardKeyboard(live: LiveSession): TgButton[][] {
+  const id = live.session.id;
+  const row = [button("Refresh", `a:${id}`), button("Summary", `p:${id}`), button("Last answer", `l:${id}`)];
+  if (live.state !== "idle") row.push(button("Stop", `x:${id}`));
+  return [row];
+}
+
+/**
+ * One session as a few lines: state and how long it has been in it, the tool it
+ * is inside with its command, the last things it said, and anything that looks
+ * stuck. The last line is the tally, so a wrong answer is easy to spot.
+ */
+export function describeActivity(live: LiveSession, activity: Activity | undefined): string {
+  const now = Date.now();
+  const state = live.state === "working"
+    ? `working ${duration(now - (activity?.turnStartedAt ?? live.since))}`
+    : live.state === "waiting" ? "waiting for you on the computer" : `idle ${duration(now - live.since)}`;
+  const lines = [
+    `${stateIcon(live)} <b>${escapeHtml(label(live))}</b> · ${escapeHtml(state)}`,
+    `<code>${escapeHtml(tildify(live.session.cwd))}</code>`,
+  ];
+  if (activity?.lastUser) lines.push(`you: <i>“${escapeHtml(activity.lastUser)}”</i>`);
+
+  const running = activity?.running ?? [];
+  for (const run of running) {
+    const age = duration(now - run.since);
+    const hint = run.hint ? ` · <code>${escapeHtml(run.hint)}</code>` : "";
+    lines.push(`🛠 <b>${escapeHtml(run.tool)}</b>${hint} · ${age}${stuck(run, now)}`);
+  }
+  if (!running.length && activity?.lastTool) {
+    const tool = activity.lastTool;
+    lines.push(`${tool.ok ? "✅" : "❌"} ${escapeHtml(tool.tool)} ${duration(now - tool.at)} ago`);
+  }
+
+  const progress = activity?.progress ?? [];
+  if (progress.length) {
+    lines.push("", `<b>last said</b>`);
+    for (const line of progress) lines.push(`· ${escapeHtml(line)}`);
+  } else if (activity?.lastAssistant) {
+    lines.push("", `· ${escapeHtml(activity.lastAssistant)}`);
+  }
+
+  const tally: string[] = [];
+  if (activity) {
+    if (activity.toolCalls) tally.push(`${activity.toolCalls} tool calls`);
+    if (activity.errors) tally.push(`${activity.errors} failed`);
+    if (activity.lastEventAt) tally.push(`last activity ${duration(now - activity.lastEventAt)} ago`);
+    if (activity.model) tally.push(escapeHtml(activity.model));
+  }
+  if (tally.length) lines.push("", `<i>${tally.join(" · ")}</i>`);
+  return lines.join("\n");
+}
+
+/** A warning for the two ways a session hangs: a tool that never returns, and silence. */
+function stuck(run: { since: number }, now: number): string {
+  const minutes = (now - run.since) / 60_000;
+  return minutes >= 10 ? ` ⚠️ ${Math.round(minutes)} min in this tool` : "";
+}
+
+function duration(milliseconds: number): string {
+  const seconds = Math.max(0, Math.round(milliseconds / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h${String(minutes % 60).padStart(2, "0")}m`;
 }
 
 function escapeHtml(text: string): string {

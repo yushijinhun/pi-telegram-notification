@@ -98,10 +98,28 @@ export interface TgCallbackQuery {
   data?: string;
 }
 
+export interface TgReaction {
+  type: "emoji" | "custom_emoji" | "paid";
+  emoji?: string;
+  custom_emoji_id?: string;
+}
+
+/** A reaction added to or removed from a message. Telegram sends one per change. */
+export interface TgMessageReaction {
+  chat: TgChat;
+  message_id: number;
+  /** The user who reacted. Missing when a chat reacted, as in channels. */
+  user?: TgUser;
+  date: number;
+  old_reaction: TgReaction[];
+  new_reaction: TgReaction[];
+}
+
 export interface TgUpdate {
   update_id: number;
   message?: TgMessage;
   callback_query?: TgCallbackQuery;
+  message_reaction?: TgMessageReaction;
 }
 
 export interface TgButton {

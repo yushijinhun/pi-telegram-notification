@@ -5,6 +5,8 @@ import { join } from "node:path";
 export interface TelegramConfig {
   botToken: string;
   chatId: string;
+  /** The model that writes status summaries, as "provider/modelId". Work stays on the session's model. */
+  summaryModel?: string;
 }
 
 export interface RemoteSettings {
@@ -62,7 +64,12 @@ export async function readTelegramConfig(path: string): Promise<TelegramConfig> 
     throw new Error(`Telegram chatId is missing in ${path}.`);
   }
 
-  return { botToken: config.botToken.trim(), chatId: String(config.chatId).trim() };
+  const summaryModel = typeof config.summaryModel === "string" ? config.summaryModel.trim() : "";
+  return {
+    botToken: config.botToken.trim(),
+    chatId: String(config.chatId).trim(),
+    ...(summaryModel ? { summaryModel } : {}),
+  };
 }
 
 /** The "remote" object of the same file, which only the daemon reads. */

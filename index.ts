@@ -11,7 +11,7 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import { readTelegramConfig } from "./src/config.ts";
 import { installNotificationFooter } from "./src/footer.ts";
-import { formatNotification, type NotificationContent } from "./src/format.ts";
+import { formatNotification, truncate, type NotificationContent } from "./src/format.ts";
 import { RemoteClient } from "./src/remote/client.ts";
 import { appendLinks, type MessageLink } from "./src/remote/links.ts";
 import {
@@ -34,6 +34,23 @@ const RUN_START_MS = 10_000;
 const COMPACTION_WAIT_MS = 10 * 60_000;
 /** Only a command handler can reload Pi, so /reload from Telegram runs this command. */
 const RELOAD_COMMAND = "telegram-reload";
+/** Status summaries are cheap and frequent, so they run on a small fast model, not on the working one. */
+const DEFAULT_SUMMARY_MODEL = "deepseek/deepseek-flash";
+const SUMMARY_TIMEOUT_MS = 90_000;
+/** How many transcript lines one summary sees. */
+const EXCERPT_LINES = 60;
+const SUMMARY_PROMPT = [
+  "You report on a coding session to its owner, who is reading on a phone away from the computer.",
+  "From the transcript, say in at most four short lines: what the agent is doing now, what it has finished,",
+  "and what it is waiting for or stuck on. Be concrete: names, numbers, commands, file paths.",
+  "No headings, no code blocks, no preamble. If the transcript does not show something, do not guess.",
+].join(" ");
+
+/** "provider/modelId" or a bare model id. */
+function splitModel(spec: string): [string | undefined, string] {
+  const slash = spec.indexOf("/");
+  return slash > 0 ? [spec.slice(0, slash), spec.slice(slash + 1)] : [undefined, spec];
+}
 
 /** Press Enter in a WezTerm pane, such as this session's own. */
 function pressEnter(pane: string): Promise<void> {
@@ -175,6 +192,76 @@ export default function (pi: ExtensionAPI) {
       // The run stopped before the requested tools returned.
       : response.stopReason === "toolUse" ? "aborted" : "completed";
     return { status, response };
+  }
+
+  /**
+   * A summary of where this session stands. It is written by the model in
+   * `summaryModel`, not by the one doing the work: reporting status is frequent
+   * and cheap, the work is neither.
+   */
+  async function summarize(ctx: ExtensionContext): Promise<string> {
+    const config = await readTelegramConfig(configPath).catch(() => undefined);
+    const [provider, id] = splitModel(config?.summaryModel ?? DEFAULT_SUMMARY_MODEL);
+    const model = provider
+      ? ctx.modelRegistry.find(provider, id)
+      : ctx.modelRegistry.getAvailable().find((candidate) => candidate.id === id);
+    if (!model) {
+      throw new Error(`unknown model ${provider ? `${provider}/${id}` : id}; set summaryModel in telegram-notification.json`);
+    }
+    // The registry resolves the provider's credentials exactly as a session turn does.
+    // complete() from pi-ai/compat cannot: it reads the environment and fails with
+    // "No API key for provider", which is what made every summary empty.
+    const message = await ctx.modelRegistry
+      .streamSimple(
+        model,
+        {
+          systemPrompt: SUMMARY_PROMPT,
+          messages: [{ role: "user", content: [{ type: "text", text: transcriptExcerpt(ctx) }], timestamp: Date.now() }],
+        },
+        { signal: AbortSignal.timeout(SUMMARY_TIMEOUT_MS) },
+      )
+      .result();
+    if (message.stopReason === "error") {
+      throw new Error(message.errorMessage || "the summary model failed");
+    }
+    const text = message.content
+      .filter((part) => part.type === "text")
+      .map((part) => part.text)
+      .join("\n")
+      .trim();
+    if (!text) throw new Error("the summary model said nothing");
+    return text;
+  }
+
+  /** The conversation so far, cut down to what a summary needs: what was asked, what was said, what failed. */
+  function transcriptExcerpt(ctx: ExtensionContext): string {
+    const lines: string[] = [];
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type !== "message") continue;
+      // The message union includes entries without content, such as bash output.
+      const message = entry.message as { role?: string; content?: unknown; isError?: boolean; toolName?: string };
+      const content = message.content;
+      const parts = Array.isArray(content) ? (content as Array<{ type?: string; text?: string; name?: string }>) : [];
+      const text = typeof content === "string"
+        ? content
+        : parts.filter((part) => part.type === "text").map((part) => part.text ?? "").join(" ");
+      const flat = text.replace(/\s+/g, " ").trim();
+      if (message.role === "user" || message.role === "assistant") {
+        if (flat) lines.push(`${message.role}: ${truncate(flat, 400)}`);
+        if (message.role === "assistant") {
+          const tools = parts.filter((part) => part.type === "toolCall").map((part) => part.name ?? "tool");
+          if (tools.length) lines.push(`assistant used: ${tools.join(", ")}`);
+        }
+      } else if (message.role === "toolResult" && message.isError) {
+        lines.push(`tool ${message.toolName ?? "tool"} failed: ${truncate(flat, 200)}`);
+      }
+    }
+    return [
+      `Session ${ctx.sessionManager.getSessionName() || ctx.sessionManager.getSessionId().slice(0, 8)} in ${ctx.cwd}.`,
+      `State: ${state === "working" ? "working" : state === "waiting" ? "waiting for an answer on the computer" : "idle"}.`,
+      "Transcript of the recent part, oldest first:",
+      ...lines.slice(-EXCERPT_LINES),
+    ].join("\n");
   }
 
   pi.registerCommand(RELOAD_COMMAND, {
@@ -447,6 +534,25 @@ export default function (pi: ExtensionAPI) {
         remote?.send({ type: "update", notify: enabled });
         answer(request.id, true);
         return;
+
+      case "summary": {
+        let summary: string;
+        try {
+          summary = await summarize(ctx);
+        } catch (error) {
+          answer(request.id, false, `No summary: ${(error as Error).message}`);
+          return;
+        }
+        const failure = await deliver(ctx, {
+          status: "summary",
+          session: ctx.sessionManager.getSessionName() || ctx.sessionManager.getSessionId().slice(0, 8),
+          cwd: ctx.cwd,
+          detail: summary,
+          markdown: false,
+        }, request.replyTo);
+        answer(request.id, !failure, failure);
+        return;
+      }
 
       case "last": {
         if (!ctx.isIdle()) {
